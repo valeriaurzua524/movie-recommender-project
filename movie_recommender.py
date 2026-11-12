@@ -1,4 +1,6 @@
 from pathlib import Path
+import argparse
+import difflib
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix, hstack
@@ -7,72 +9,84 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler
 
 DATA_DIR = Path(__file__).resolve().parent
-#load the MovieLens small dataset
-movies = pd.read_csv(DATA_DIR / "movies.csv")
-ratings = pd.read_csv(DATA_DIR / "ratings.csv")
-movies = movies[["movieId", "title", "genres"]].copy()
+GENRE_WEIGHT = 3.0
+RATING_WEIGHT = 0.20
+PRIOR_RATINGS = 20 #Shrink low-sample movie averages toward the overall mean
 
-#turns pipe-separated genres into text for TF-IDF
-movies["genre_text"] = (
-    movies["genres"]
-    .fillna("")
-    .replace("(no genres listed)", "")
-    .str.replace("|", " ", regex=False)
-    .str.replace("Sci-Fi", "SciFi", regex=False)
-    .str.replace("Film-Noir", "FilmNoir", regex=False)
-)
-vectorizer = TfidfVectorizer(token_pattern=r"(?u)\b\w+\b")
-genre_features = vectorizer.fit_transform(movies["genre_text"])
 
-#compute each movie's mean rating and number of ratings.
-rating_stats = ratings.groupby("movieId")["rating"].agg(["mean", "count"])
-movies = movies.join(rating_stats, on="movieId")
+def load_model(data_dir=DATA_DIR):
+    """Load data and construct sparse genre + rating feature vectors."""
+    try:
+        movies = pd.read_csv(data_dir / 'movies.csv', usecols=['movieId', 'title', 'genres'])
+        ratings = pd.read_csv(data_dir / 'ratings.csv', usecols=['movieId', 'rating'])
+    except (FileNotFoundError, ValueError) as exc:
+        raise RuntimeError(f'Could not load MovieLens CSV files from {data_dir}: {exc}') from exc
+    if movies.empty or ratings.empty:
+        raise RuntimeError('Movie and rating CSV files must not be empty.')
+    movies = movies.drop_duplicates('movieId').reset_index(drop=True)
+    genre_text = (movies['genres'].fillna('').replace('(no genres listed)', '')
+                  .str.replace('Sci-Fi', 'SciFi', regex=False)
+                  .str.replace('Film-Noir', 'FilmNoir', regex=False)
+                  .str.replace('|', ' ', regex=False))
+    if not genre_text.str.strip().any():
+        raise RuntimeError('No usable genres found in movies.csv.')
+    genres = TfidfVectorizer(token_pattern=r'(?u)\b\w+\b').fit_transform(genre_text)
+    stats = ratings.groupby('movieId')['rating'].agg(['mean', 'count'])
+    movies = movies.join(stats, on='movieId')
+    overall_mean = float(ratings['rating'].mean())
+    count = movies['count'].fillna(0).to_numpy()
+    mean = movies['mean'].fillna(overall_mean).to_numpy()
+    #Bayesian smoothing prevents a single five-star rating from dominating
+    smoothed_mean = (count * mean + PRIOR_RATINGS * overall_mean) / (count + PRIOR_RATINGS)
+    rating_data = np.column_stack([smoothed_mean, np.log1p(count)])
+    rating_features = StandardScaler().fit_transform(rating_data)
+    features = hstack([genres * GENRE_WEIGHT, csr_matrix(rating_features * RATING_WEIGHT)], format='csr')
+    titles = movies['title'].astype(str).tolist()
+    lookup = {title.casefold(): idx for idx, title in enumerate(titles)}
+    return titles, lookup, features
 
-#missing ratings receive the dataset-wide mean and zero rating count
-global_mean = float(ratings["rating"].mean())
-movies["mean"] = movies["mean"].fillna(global_mean)
-movies["count"] = movies["count"].fillna(0)
 
-#center rating features and scale them so they do not overpower genres
-rating_values = np.column_stack([
-    movies["mean"].to_numpy(),
-    np.log1p(movies["count"].to_numpy()),
-])
-rating_features = StandardScaler().fit_transform(rating_values)
-#genres have more weight than rating statistics in the similarity score
-features = hstack([
-    genre_features * 3.0,
-    csr_matrix(rating_features * 0.35),
-], format="csr")
-#allow exact titles, including their release year
-title_to_row = {
-    title.lower(): i for i, title in enumerate(movies["title"])
-}
-def recommend(title, n=5):
-    """Return up to n similar movies and their cosine similarity scores."""
-    row = title_to_row.get(title.strip().lower())
+def recommend(title, titles, lookup, features, n=5):
+    """Return movie title and similarity pairs; suggest close titles on misses."""
+    if n < 1:
+        raise ValueError('n must be at least 1')
+    query = title.strip().casefold()
+    row = lookup.get(query)
     if row is None:
-        return ["Movie not found. Please enter the full title with the year."]
+        matches = difflib.get_close_matches(query, list(lookup), n=5, cutoff=0.45)
+        suggestions = [titles[lookup[match]] for match in matches]
+        return [], suggestions
+    scores = cosine_similarity(features[row], features).ravel()
+    scores[row] = -np.inf
+    best = np.argsort(scores)[::-1][:min(n, len(titles) - 1)]
+    return [(titles[i], float(scores[i])) for i in best], []
 
-    #compare only the selected movie with the catalog, not every movie pair.
-    similarities = cosine_similarity(features[row], features).ravel()
-    similarities[row] = -1  #dont recommend the input movie itself
-    best_rows = np.argsort(similarities)[::-1][:n]
 
-    return [
-        f"{movies.iloc[i]['title']} (similarity={similarities[i]:.3f})"
-        for i in best_rows
-    ]
+def main():
+    parser = argparse.ArgumentParser(description='Recommend similar MovieLens movies.')
+    parser.add_argument('--movie', help='Movie title including year, e.g. "Toy Story (1995)"')
+    parser.add_argument('--top', type=int, default=5, help='Number of recommendations (default: 5)')
+    args = parser.parse_args()
+    if args.top < 1:
+        parser.error('--top must be at least 1')
+    try:
+        titles, lookup, features = load_model()
+    except RuntimeError as exc:
+        parser.exit(1, f'Error: {exc}\n')
+    examples = ['Toy Story (1995)', 'Jumanji (1995)', 'Heat (1995)', 'GoldenEye (1995)']
+    for movie in ([args.movie] if args.movie else examples):
+        results, suggestions = recommend(movie, titles, lookup, features, args.top)
+        print(f'\nInput movie: {movie}\nRecommendations:')
+        if suggestions:
+            print('  Movie not found. Did you mean:')
+            for suggestion in suggestions:
+                print(f'  - {suggestion}')
+        elif not results:
+            print('  No recommendations available.')
+        else:
+            for title, score in results:
+                print(f'  - {title} (similarity={score:.3f})')
 
-if __name__ == "__main__":
-    test_movies = [
-        "Toy Story (1995)",
-        "Jumanji (1995)",
-        "Heat (1995)",
-        "GoldenEye (1995)",
-    ]
-    for movie in test_movies:
-        print(f"\nInput movie: {movie}")
-        print("Recommendations:")
-        for result in recommend(movie, n=5):
-            print(f"  - {result}")
+
+if __name__ == '__main__':
+    main()
